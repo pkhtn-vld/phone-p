@@ -87,12 +87,17 @@
       let pc = null;
       let localStream = null;
 
+      function makeCallId() {
+        try {
+          if (myId) return `${myId}-${Date.now()}`;
+        } catch (e) { }
+        return `c-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      }
+
       // добавляем публичный STUN, без TURN — для быстрых тестов
       const iceConfig = {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' }
-          // для реальных интернет-сцен добавьте TURN здесь
-          // { urls: 'turn:your-turn.example:3478', username: 'user', credential: 'pass' }
         ]
       };
 
@@ -106,10 +111,9 @@
         if (msg.type === 'offer') {
           log('// got offer');
           if (pc) { pc.close(); pc = null; }
+          const callId = msg.callId || makeCallId();
           pc = new RTCPeerConnection(iceConfig);
-          pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate })); };
-          // ---------- ЗАМЕНИТЬ: pc.ontrack (используется в обоих местах: при создании pc для caller и для callee) ----------
-          // замените текущую реализацию pc.ontrack = (e) => { ... } на этот фрагмент
+          pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
           pc.ontrack = (e) => {
             try {
               log('// ontrack', e.streams);
@@ -184,12 +188,14 @@
             }
           };
 
+          const diag = monitorPeerConnection(callId, pc);
 
           if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
           await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
           const ans = await pc.createAnswer();
           await pc.setLocalDescription(ans);
-          ws.send(JSON.stringify({ type: 'answer', sdp: ans.sdp }));
+          ws.send(JSON.stringify({ type: 'answer', sdp: ans.sdp, callId }));
+
           log('// answer sent');
           return;
         }
@@ -202,28 +208,23 @@
         }
 
         if (msg.type === 'candidate') {
-          log('// got candidate');
+          log('// got candidate', msg.callId || '');
           if (!pc) { log('// no pc yet — ignored candidate'); return; }
           try { await pc.addIceCandidate(msg.candidate); log('// added candidate'); } catch (e) { log('// addIceCandidate failed', e); }
           return;
         }
       });
 
-      // ---------- ЗАМЕНИТЬ: handler для кнопки "Разрешить микрофон" ----------
-      // заменяет существующий document.getElementById('btnLocal').addEventListener('click', ... )
       document.getElementById('btnLocal').addEventListener('click', async () => {
-        // comment: acquire local mic & start analyser
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
           log('// local stream acquired', localStream.getTracks().map(t => t.kind));
 
-          // comment: создаём AudioContext для локального анализа (видно, что микрофон даёт сигнал)
           if (!window.localAudioContext) {
             window.localAudioContext = new (window.AudioContext || window.webkitAudioContext)();
           }
           const lac = window.localAudioContext;
 
-          // comment: если уже был созднан source — очистим
           if (window._localAnalyserInterval) {
             clearInterval(window._localAnalyserInterval);
             window._localAnalyserInterval = null;
@@ -235,11 +236,9 @@
           source.connect(analyser);
           const data = new Uint8Array(analyser.fftSize);
 
-          // comment: интервал измерения RMS уровня (каждые 250ms)
           window._localAnalyserInterval = setInterval(() => {
             try {
               analyser.getByteTimeDomainData(data);
-              // compute RMS (0..1)
               let sum = 0;
               for (let i = 0; i < data.length; i++) {
                 const v = (data[i] - 128) / 128;
@@ -248,7 +247,6 @@
               const rms = Math.sqrt(sum / data.length);
               const rms100 = Math.round(rms * 1000) / 1000;
               log(`// local-audio-level ${rms100}`);
-              // отправим на сервер для общей трассировки
               try {
                 fetch('/debug/log', {
                   method: 'POST',
@@ -273,10 +271,14 @@
       document.getElementById('btnCall').addEventListener('click', async () => {
         log('// call: start');
         if (pc) { pc.close(); pc = null; }
-        pc = new RTCPeerConnection(iceConfig);
-        pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate })); };
-        // ---------- ЗАМЕНИТЬ: pc.ontrack (используется в обоих местах: при создании pc для caller и для callee) ----------
-        // замените текущую реализацию pc.ontrack = (e) => { ... } на этот фрагмент
+        const callId = makeCallId();
+
+        const resp = await fetch('/get-turn-credentials');
+        const data = await resp.json();
+
+        pc = new RTCPeerConnection({ iceServers: data.iceServers });
+        window.pc = pc;
+        pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
         pc.ontrack = (e) => {
           try {
             log('// ontrack', e.streams);
@@ -351,6 +353,7 @@
           }
         };
 
+        const diag = monitorPeerConnection(callId, pc);
         if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
         const offer = await pc.createOffer();
@@ -359,24 +362,19 @@
         log('// offer sent');
       });
 
-      // ---------- ЗАМЕНИТЬ: handler для кнопки "Hang up" (повесить трубку) ----------
-      // замените текущую реализацию document.getElementById('btnHang').addEventListener('click', ...)
       document.getElementById('btnHang').addEventListener('click', () => {
         if (pc) { pc.close(); pc = null; log('// pc closed'); }
 
-        // comment: очистка локального анализатора/интервала
         try {
           if (window._localAnalyserInterval) { clearInterval(window._localAnalyserInterval); window._localAnalyserInterval = null; }
           if (window.localAudioContext) { try { window.localAudioContext.close(); } catch (e) { } window.localAudioContext = null; }
         } catch (e) { }
 
-        // comment: очистка удалённого анализатора/интервала
         try {
           if (window._remoteAnalyserInterval) { clearInterval(window._remoteAnalyserInterval); window._remoteAnalyserInterval = null; }
           if (window.remoteAudioContext) { try { window.remoteAudioContext.close(); } catch (e) { } window.remoteAudioContext = null; }
         } catch (e) { }
 
-        // comment: остановим локальные треки, если нужно (чтобы микрофон перестал работать)
         try {
           if (localStream) {
             localStream.getTracks().forEach(t => { try { t.stop(); } catch (e) { } });
@@ -386,6 +384,91 @@
         } catch (e) { }
       });
 
+
+      function monitorPeerConnection(callId, pc) {
+        function clog(...args) { console.log('// diag', callId, ...args); }
+
+        pc.addEventListener('iceconnectionstatechange', () => clog('iceConnectionState', pc.iceConnectionState));
+        pc.addEventListener('connectionstatechange', () => clog('connectionState', pc.connectionState));
+        pc.addEventListener('icegatheringstatechange', () => clog('iceGatheringState', pc.iceGatheringState));
+
+        try {
+          const senders = pc.getSenders().map(s => ({ id: s && s.track ? s.track.id : null, kind: s && s.track ? s.track.kind : null, enabled: s && s.track ? s.track.enabled : null }));
+          const trans = pc.getTransceivers().map(t => ({ mid: t.mid, direction: t.direction, senderKind: (t.sender && t.sender.track && t.sender.track.kind) || null }));
+          clog('initial-senders', senders, 'transceivers', trans);
+        } catch (e) { clog('initial-senders-error', String(e)); }
+
+        async function pollStatsOnce() {
+          try {
+            const stats = await pc.getStats();
+            let candidatePair = null;
+            let outbound = null;
+            let inbound = null;
+            stats.forEach(report => {
+              if (report.type === 'candidate-pair' && report.selected) candidatePair = report;
+              if (report.type === 'candidate-pair' && (report.nominated || report.selected)) candidatePair = candidatePair || report;
+              if (report.type === 'outbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) outbound = outbound || report;
+              if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) inbound = inbound || report;
+            });
+
+            if (!candidatePair) {
+              stats.forEach(report => { if (report.type === 'candidate-pair' && !candidatePair) candidatePair = report; });
+            }
+
+            const cpSummary = candidatePair ? {
+              id: candidatePair.id,
+              state: candidatePair.state || candidatePair.selected || null,
+              writable: candidatePair.writable || candidatePair.writable === false ? candidatePair.writable : null,
+              nominated: candidatePair.nominated || null,
+              localCandidateId: candidatePair.localCandidateId || null,
+              remoteCandidateId: candidatePair.remoteCandidateId || null,
+              bytesSent: candidatePair.bytesSent || 0,
+              bytesReceived: candidatePair.bytesReceived || 0,
+              totalRoundTripTime: candidatePair.totalRoundTripTime || null
+            } : null;
+
+            const outSummary = outbound ? {
+              id: outbound.id,
+              type: outbound.type,
+              bytesSent: outbound.bytesSent || 0,
+              packetsSent: outbound.packetsSent || 0,
+              codecId: outbound.codecId || null
+            } : null;
+
+            const inSummary = inbound ? {
+              id: inbound.id,
+              bytesReceived: inbound.bytesReceived || 0,
+              packetsReceived: inbound.packetsReceived || 0,
+              codecId: inbound.codecId || null
+            } : null;
+
+            clog('stats', { candidatePair: cpSummary, outbound: outSummary, inbound: inSummary });
+            return { candidatePair: cpSummary, outbound: outSummary, inbound: inSummary };
+          } catch (e) {
+            clog('getStats-error', String(e));
+            return null;
+          }
+        }
+
+        let ticks = 0;
+        const intervalId = setInterval(async () => {
+          ticks += 1;
+          const s = await pollStatsOnce();
+          if (s && s.candidatePair && (s.candidatePair.writable === true || (s.outbound && s.outbound.bytesSent > 0))) {
+            clog('media-path OK — writable or bytesSent > 0', s);
+            // после подтверждения можно остановить интенсивный поллинг (оставим ещё пару проверок)
+            if (ticks > 5) {
+              clearInterval(intervalId);
+            }
+          }
+          if (ticks > 60) clearInterval(intervalId);
+        }, 1000);
+
+        return {
+          stop() { clearInterval(intervalId); },
+          pollNow: pollStatsOnce
+        };
+      }
 
     })();
   </script>
