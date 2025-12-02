@@ -108,19 +108,82 @@
           if (pc) { pc.close(); pc = null; }
           pc = new RTCPeerConnection(iceConfig);
           pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate })); };
+          // ---------- ЗАМЕНИТЬ: pc.ontrack (используется в обоих местах: при создании pc для caller и для callee) ----------
+          // замените текущую реализацию pc.ontrack = (e) => { ... } на этот фрагмент
           pc.ontrack = (e) => {
-            log('// ontrack', e.streams);
-            const aud = remoteAudio;
-            aud.srcObject = e.streams[0];
-            // если пользователь уже сделал жест — попробуем play
-            if (audioEnabled) {
-              aud.muted = false;
-              aud.play().then(() => log('// remote audio play OK')).catch(err => log('// remote audio play failed', String(err)));
-            } else {
-              // оставляем muted=true — пользователь должен нажать кнопку
-              log('// remote stream attached but waiting for user gesture to unmute/play');
+            try {
+              log('// ontrack', e.streams);
+              const remoteStream = (e.streams && e.streams[0]) || e.stream || null;
+              const aud = remoteAudio; // <audio id="remoteAudio">
+              aud.srcObject = remoteStream;
+
+              // comment: мониторинг удалённого потока
+              // создаём/переиспользуем AudioContext для remote
+              if (!window.remoteAudioContext) {
+                window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+              }
+              const rac = window.remoteAudioContext;
+
+              // очистим предыдущий интервал, если был
+              if (window._remoteAnalyserInterval) {
+                clearInterval(window._remoteAnalyserInterval);
+                window._remoteAnalyserInterval = null;
+              }
+
+              try {
+                const remoteSource = rac.createMediaStreamSource(remoteStream);
+                const remoteAnalyser = rac.createAnalyser();
+                remoteAnalyser.fftSize = 2048;
+                remoteSource.connect(remoteAnalyser);
+                const data = new Uint8Array(remoteAnalyser.fftSize);
+
+                // измеряем RMS удалённого аудио
+                window._remoteAnalyserInterval = setInterval(() => {
+                  try {
+                    remoteAnalyser.getByteTimeDomainData(data);
+                    let sum = 0;
+                    for (let i = 0; i < data.length; i++) {
+                      const v = (data[i] - 128) / 128;
+                      sum += v * v;
+                    }
+                    const rms = Math.sqrt(sum / data.length);
+                    const rms100 = Math.round(rms * 1000) / 1000;
+                    log(`// remote-audio-level ${rms100}`);
+                    // отправка на сервер для диагностики
+                    try {
+                      fetch('/debug/log', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          ts: new Date().toISOString(),
+                          src: 'client-audio-monitor',
+                          kind: 'remote_audio_level',
+                          data: { level: rms100 }
+                        })
+                      }).catch(() => {/* ignore */ });
+                    } catch (e) { }
+                  } catch (err) { /* ignore per-interval errors */ }
+                }, 250);
+              } catch (err) {
+                log('// remote analyser setup failed', String(err));
+              }
+
+              // comment: попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
+              if (audioEnabled) {
+                aud.muted = false;
+                aud.play().then(() => { log('// remote audio play OK'); })
+                  .catch((err) => { log('// remote audio play failed', String(err)); });
+              } else {
+                // если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn
+                aud.muted = true;
+                log('// ontrack but waiting for user gesture');
+              }
+
+            } catch (e) {
+              log('// ontrack handler failed', e);
             }
           };
+
 
           if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
           await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
@@ -146,20 +209,147 @@
         }
       });
 
+      // ---------- ЗАМЕНИТЬ: handler для кнопки "Разрешить микрофон" ----------
+      // заменяет существующий document.getElementById('btnLocal').addEventListener('click', ... )
       document.getElementById('btnLocal').addEventListener('click', async () => {
+        // comment: acquire local mic & start analyser
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
           log('// local stream acquired', localStream.getTracks().map(t => t.kind));
-          // если хотим — можно сразу создать pc и добавить track, но оставим до звонка
-        } catch (e) { log('// getUserMedia failed', e); }
+
+          // comment: создаём AudioContext для локального анализа (видно, что микрофон даёт сигнал)
+          if (!window.localAudioContext) {
+            window.localAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+          }
+          const lac = window.localAudioContext;
+
+          // comment: если уже был созднан source — очистим
+          if (window._localAnalyserInterval) {
+            clearInterval(window._localAnalyserInterval);
+            window._localAnalyserInterval = null;
+          }
+
+          const source = lac.createMediaStreamSource(localStream);
+          const analyser = lac.createAnalyser();
+          analyser.fftSize = 2048;
+          source.connect(analyser);
+          const data = new Uint8Array(analyser.fftSize);
+
+          // comment: интервал измерения RMS уровня (каждые 250ms)
+          window._localAnalyserInterval = setInterval(() => {
+            try {
+              analyser.getByteTimeDomainData(data);
+              // compute RMS (0..1)
+              let sum = 0;
+              for (let i = 0; i < data.length; i++) {
+                const v = (data[i] - 128) / 128;
+                sum += v * v;
+              }
+              const rms = Math.sqrt(sum / data.length);
+              const rms100 = Math.round(rms * 1000) / 1000;
+              log(`// local-audio-level ${rms100}`);
+              // отправим на сервер для общей трассировки
+              try {
+                fetch('/debug/log', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    ts: new Date().toISOString(),
+                    src: 'client-audio-monitor',
+                    kind: 'local_audio_level',
+                    data: { level: rms100 }
+                  })
+                }).catch(() => {/* ignore network errors */ });
+              } catch (e) { }
+            } catch (e) { /* ignore */ }
+          }, 250);
+
+        } catch (e) {
+          log('// getUserMedia failed', e);
+        }
       });
+
 
       document.getElementById('btnCall').addEventListener('click', async () => {
         log('// call: start');
         if (pc) { pc.close(); pc = null; }
         pc = new RTCPeerConnection(iceConfig);
         pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate })); };
-        pc.ontrack = (e) => { log('// ontrack', e.streams); const aud = remoteAudio; aud.srcObject = e.streams[0]; if (audioEnabled) { aud.muted = false; aud.play().then(() => log('// remote play OK')).catch(err => log('// remote play failed', String(err))); } else log('// ontrack but waiting for user gesture'); };
+        // ---------- ЗАМЕНИТЬ: pc.ontrack (используется в обоих местах: при создании pc для caller и для callee) ----------
+        // замените текущую реализацию pc.ontrack = (e) => { ... } на этот фрагмент
+        pc.ontrack = (e) => {
+          try {
+            log('// ontrack', e.streams);
+            const remoteStream = (e.streams && e.streams[0]) || e.stream || null;
+            const aud = remoteAudio; // <audio id="remoteAudio">
+            aud.srcObject = remoteStream;
+
+            // comment: мониторинг удалённого потока
+            // создаём/переиспользуем AudioContext для remote
+            if (!window.remoteAudioContext) {
+              window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            const rac = window.remoteAudioContext;
+
+            // очистим предыдущий интервал, если был
+            if (window._remoteAnalyserInterval) {
+              clearInterval(window._remoteAnalyserInterval);
+              window._remoteAnalyserInterval = null;
+            }
+
+            try {
+              const remoteSource = rac.createMediaStreamSource(remoteStream);
+              const remoteAnalyser = rac.createAnalyser();
+              remoteAnalyser.fftSize = 2048;
+              remoteSource.connect(remoteAnalyser);
+              const data = new Uint8Array(remoteAnalyser.fftSize);
+
+              // измеряем RMS удалённого аудио
+              window._remoteAnalyserInterval = setInterval(() => {
+                try {
+                  remoteAnalyser.getByteTimeDomainData(data);
+                  let sum = 0;
+                  for (let i = 0; i < data.length; i++) {
+                    const v = (data[i] - 128) / 128;
+                    sum += v * v;
+                  }
+                  const rms = Math.sqrt(sum / data.length);
+                  const rms100 = Math.round(rms * 1000) / 1000;
+                  log(`// remote-audio-level ${rms100}`);
+                  // отправка на сервер для диагностики
+                  try {
+                    fetch('/debug/log', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        ts: new Date().toISOString(),
+                        src: 'client-audio-monitor',
+                        kind: 'remote_audio_level',
+                        data: { level: rms100 }
+                      })
+                    }).catch(() => {/* ignore */ });
+                  } catch (e) { }
+                } catch (err) { /* ignore per-interval errors */ }
+              }, 250);
+            } catch (err) {
+              log('// remote analyser setup failed', String(err));
+            }
+
+            // comment: попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
+            if (audioEnabled) {
+              aud.muted = false;
+              aud.play().then(() => { log('// remote audio play OK'); })
+                .catch((err) => { log('// remote audio play failed', String(err)); });
+            } else {
+              // если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn
+              aud.muted = true;
+              log('// ontrack but waiting for user gesture');
+            }
+
+          } catch (e) {
+            log('// ontrack handler failed', e);
+          }
+        };
 
         if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
@@ -169,9 +359,33 @@
         log('// offer sent');
       });
 
+      // ---------- ЗАМЕНИТЬ: handler для кнопки "Hang up" (повесить трубку) ----------
+      // замените текущую реализацию document.getElementById('btnHang').addEventListener('click', ...)
       document.getElementById('btnHang').addEventListener('click', () => {
         if (pc) { pc.close(); pc = null; log('// pc closed'); }
+
+        // comment: очистка локального анализатора/интервала
+        try {
+          if (window._localAnalyserInterval) { clearInterval(window._localAnalyserInterval); window._localAnalyserInterval = null; }
+          if (window.localAudioContext) { try { window.localAudioContext.close(); } catch (e) { } window.localAudioContext = null; }
+        } catch (e) { }
+
+        // comment: очистка удалённого анализатора/интервала
+        try {
+          if (window._remoteAnalyserInterval) { clearInterval(window._remoteAnalyserInterval); window._remoteAnalyserInterval = null; }
+          if (window.remoteAudioContext) { try { window.remoteAudioContext.close(); } catch (e) { } window.remoteAudioContext = null; }
+        } catch (e) { }
+
+        // comment: остановим локальные треки, если нужно (чтобы микрофон перестал работать)
+        try {
+          if (localStream) {
+            localStream.getTracks().forEach(t => { try { t.stop(); } catch (e) { } });
+            localStream = null;
+            log('// local stream stopped');
+          }
+        } catch (e) { }
       });
+
 
     })();
   </script>
