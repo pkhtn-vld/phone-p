@@ -42,48 +42,87 @@
   <audio id="remoteAudio" autoplay playsinline></audio>
 
   <script>
-
-    // простой клиент для теста на двух устройствах.
     (function () {
       const logEl = document.getElementById('log');
       const myIdEl = document.getElementById('myId');
       function log(...args) { console.log(...args); logEl.textContent += args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
 
+      // кнопка для пользовательского жеста — создаём, если её нет в DOM
+      let audioEnabled = false;
+      let enableBtn = document.getElementById('enableAudioBtn');
+      if (!enableBtn) {
+        enableBtn = document.createElement('button');
+        enableBtn.id = 'enableAudioBtn';
+        enableBtn.textContent = 'Включить звук (нужен для авто-воспроизведения)';
+        enableBtn.style.margin = '6px';
+        document.body.insertBefore(enableBtn, document.getElementById('log'));
+      }
 
+      const remoteAudio = document.getElementById('remoteAudio');
+      // если браузер требует пользовательский жест, держим audio muted до нажатия
+      remoteAudio.muted = true;
+
+      enableBtn.addEventListener('click', async () => {
+        try {
+          // пытаемся play() — если получилось, считаем что autoplay разрешён
+          await remoteAudio.play();
+          remoteAudio.muted = false; // можно убрать заглушку
+          audioEnabled = true;
+          enableBtn.textContent = 'Звук включён';
+          enableBtn.disabled = true;
+          log('// audio enabled by user gesture');
+        } catch (e) {
+          // если play() не удалось — оставляем muted, но помечаем что пользователь сделал жест
+          audioEnabled = true;
+          enableBtn.textContent = 'Жест зафиксирован — звук разрешён после приема потока';
+          enableBtn.disabled = true;
+          log('// audio enable attempted, play() failed (это нормально в некоторых браузерах):', String(e));
+        }
+      });
+
+      // WebSocket
       const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
       const ws = new WebSocket(wsProto + '://' + location.host + '/ws');
       let myId = null;
       let pc = null;
       let localStream = null;
 
-
-      // TURN можно подставить
-      const iceConfig = { iceServers: [ /*{urls:'stun:stun.l.google.com:19302'}, {urls:'turn:YOUR_TURN:3478', username:'u', credential:'p'}*/] };
-
+      // добавляем публичный STUN, без TURN — для быстрых тестов
+      const iceConfig = {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' }
+          // для реальных интернет-сцен добавьте TURN здесь
+          // { urls: 'turn:your-turn.example:3478', username: 'user', credential: 'pass' }
+        ]
+      };
 
       ws.addEventListener('open', () => log('// ws OPEN'));
       ws.addEventListener('message', async (ev) => {
         let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
         log('// ws IN', msg.type || msg);
 
+        if (msg.type === 'welcome') { myId = msg.id; myIdEl.textContent = myId; return; }
 
-        if (msg.type === 'welcome') {
-          myId = msg.id; myIdEl.textContent = myId; return;
-        }
-
-
-        // сигнал - offer
         if (msg.type === 'offer') {
           log('// got offer');
-          if (pc) { log('// have existing pc - cleaning'); pc.close(); pc = null; }
+          if (pc) { pc.close(); pc = null; }
           pc = new RTCPeerConnection(iceConfig);
           pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate })); };
-          pc.ontrack = (e) => { log('// ontrack', e.streams); const aud = document.getElementById('remoteAudio'); aud.srcObject = e.streams[0]; };
-
+          pc.ontrack = (e) => {
+            log('// ontrack', e.streams);
+            const aud = remoteAudio;
+            aud.srcObject = e.streams[0];
+            // если пользователь уже сделал жест — попробуем play
+            if (audioEnabled) {
+              aud.muted = false;
+              aud.play().then(() => log('// remote audio play OK')).catch(err => log('// remote audio play failed', String(err)));
+            } else {
+              // оставляем muted=true — пользователь должен нажать кнопку
+              log('// remote stream attached but waiting for user gesture to unmute/play');
+            }
+          };
 
           if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-
           await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
           const ans = await pc.createAnswer();
           await pc.setLocalDescription(ans);
@@ -92,44 +131,37 @@
           return;
         }
 
-
         if (msg.type === 'answer') {
           log('// got answer');
-          if (!pc) return; try { await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }); log('// remoteDescription(answer) set'); } catch (e) { log('// setRemoteDescription(answer) failed', e); }
+          if (!pc) return;
+          try { await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }); log('// remoteDescription(answer) set'); } catch (e) { log('// setRemoteDescription(answer) failed', e); }
           return;
         }
 
-
         if (msg.type === 'candidate') {
           log('// got candidate');
-          if (!pc) {
-            log('// no pc yet — ignored candidate'); return;
-          }
+          if (!pc) { log('// no pc yet — ignored candidate'); return; }
           try { await pc.addIceCandidate(msg.candidate); log('// added candidate'); } catch (e) { log('// addIceCandidate failed', e); }
           return;
         }
       });
 
-
-      // кнопки
       document.getElementById('btnLocal').addEventListener('click', async () => {
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
           log('// local stream acquired', localStream.getTracks().map(t => t.kind));
+          // если хотим — можно сразу создать pc и добавить track, но оставим до звонка
         } catch (e) { log('// getUserMedia failed', e); }
       });
 
-
       document.getElementById('btnCall').addEventListener('click', async () => {
         log('// call: start');
-        if (pc) { log('// existing pc - closing'); pc.close(); pc = null; }
+        if (pc) { pc.close(); pc = null; }
         pc = new RTCPeerConnection(iceConfig);
         pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate })); };
-        pc.ontrack = (e) => { log('// ontrack', e.streams); const aud = document.getElementById('remoteAudio'); aud.srcObject = e.streams[0]; };
-
+        pc.ontrack = (e) => { log('// ontrack', e.streams); const aud = remoteAudio; aud.srcObject = e.streams[0]; if (audioEnabled) { aud.muted = false; aud.play().then(() => log('// remote play OK')).catch(err => log('// remote play failed', String(err))); } else log('// ontrack but waiting for user gesture'); };
 
         if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
 
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
@@ -137,14 +169,11 @@
         log('// offer sent');
       });
 
-
       document.getElementById('btnHang').addEventListener('click', () => {
         if (pc) { pc.close(); pc = null; log('// pc closed'); }
       });
 
-
     })();
-
   </script>
 </body>
 
