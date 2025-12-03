@@ -35,9 +35,6 @@
     <button id="btnHang">Завершить</button>
   </div>
   <div>Ваш id: <span id="myId">-</span></div>
-  <div>Логи:</div>
-  <div id="log"></div>
-
 
   <audio id="remoteAudio" autoplay playsinline></audio>
 
@@ -89,10 +86,38 @@
       }
 
       const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+      const iceConfigMetered = {
+        iceServers: [
+          {
+            urls: "stun:stun.relay.metered.ca:80",
+          },
+          {
+            urls: "turn:global.relay.metered.ca:80",
+            username: "b645e5006871c1576c0d5def",
+            credential: "SeEPzBuUQ4NyV0tl",
+          },
+          {
+            urls: "turn:global.relay.metered.ca:80?transport=tcp",
+            username: "b645e5006871c1576c0d5def",
+            credential: "SeEPzBuUQ4NyV0tl",
+          },
+          {
+            urls: "turn:global.relay.metered.ca:443",
+            username: "b645e5006871c1576c0d5def",
+            credential: "SeEPzBuUQ4NyV0tl",
+          },
+          {
+            urls: "turns:global.relay.metered.ca:443?transport=tcp",
+            username: "b645e5006871c1576c0d5def",
+            credential: "SeEPzBuUQ4NyV0tl",
+          },
+        ],
+      };
 
       // Создание PeerConnection
       function createPeerConnection(callId) {
-        const connection = new RTCPeerConnection(iceConfig);
+        // const connection = new RTCPeerConnection(iceConfig);
+        const connection = new RTCPeerConnection(iceConfigMetered);
         connection.onicecandidate = e => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
         connection.ontrack = e => {
           const stream = (e.streams && e.streams[0]) || e.stream || null;
