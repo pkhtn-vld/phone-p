@@ -121,7 +121,7 @@
               const aud = remoteAudio; // <audio id="remoteAudio">
               aud.srcObject = remoteStream;
 
-              // comment: мониторинг удалённого потока
+              // мониторинг удалённого потока
               // создаём/переиспользуем AudioContext для remote
               if (!window.remoteAudioContext) {
                 window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -172,7 +172,7 @@
                 log('// remote analyser setup failed', String(err));
               }
 
-              // comment: попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
+              // попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
               if (audioEnabled) {
                 aud.muted = false;
                 aud.play().then(() => { log('// remote audio play OK'); })
@@ -273,10 +273,14 @@
         if (pc) { pc.close(); pc = null; }
         const callId = makeCallId();
 
-        const resp = await fetch('/get-turn-credentials');
-        const data = await resp.json();
+        // const resp = await fetch('/get-turn-credentials');
+        // const data = await resp.json();
 
-        pc = new RTCPeerConnection({ iceServers: data.iceServers });
+        // дефолтный ICE (без TURN) — можно оставить stun или пустой
+        const defaultIce = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+
+        pc = new RTCPeerConnection({ iceServers: defaultIce });
         window.pc = pc;
         pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
         pc.ontrack = (e) => {
@@ -286,7 +290,7 @@
             const aud = remoteAudio; // <audio id="remoteAudio">
             aud.srcObject = remoteStream;
 
-            // comment: мониторинг удалённого потока
+            // мониторинг удалённого потока
             // создаём/переиспользуем AudioContext для remote
             if (!window.remoteAudioContext) {
               window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
@@ -337,7 +341,7 @@
               log('// remote analyser setup failed', String(err));
             }
 
-            // comment: попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
+            // попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
             if (audioEnabled) {
               aud.muted = false;
               aud.play().then(() => { log('// remote audio play OK'); })

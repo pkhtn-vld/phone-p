@@ -32,7 +32,7 @@ app.get('/get-turn-credentials', async (req, res) => {
         'Authorization': `Bearer ${secret}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ ttl: 3600 }) // пример: просим креды на час
+      body: JSON.stringify({ ttl: 3600 }) // просим креды на час
     });
     const body = await r.json();
     // body должен содержать iceServers или username/credential
@@ -43,12 +43,12 @@ app.get('/get-turn-credentials', async (req, res) => {
   }
 });
 
-// // comment: добавить endpoint для приёма логов от клиента (debug)
+// добавить endpoint для приёма логов от клиента (debug)
 app.post('/debug/log', express.json(), (req, res) => {
-  // comment: принимаем произвольный JSON лог от клиента и просто пишем в консоль
+  // принимаем произвольный JSON лог от клиента и просто пишем в консоль
   try {
     const body = req.body;
-    // comment: защита — не выводим слишком длинные поле 'data', укоротим при необходимости
+    // защита — не выводим слишком длинные поле 'data', укоротим при необходимости
     const safe = JSON.stringify(body, (k, v) => {
       if (typeof v === 'string' && v.length > 1000) return v.slice(0, 1000) + '...';
       return v;
@@ -57,7 +57,7 @@ app.post('/debug/log', express.json(), (req, res) => {
   } catch (e) {
     console.log('// debug-log parse error', String(e));
   }
-  // comment: всегда отвечает 204 — чтобы клиент не падал при сетевых ошибках
+  // всегда отвечает 204 — чтобы клиент не падал при сетевых ошибках
   res.status(204).end();
 });
 
