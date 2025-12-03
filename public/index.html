@@ -62,23 +62,72 @@
       // если браузер требует пользовательский жест, держим audio muted до нажатия
       remoteAudio.muted = true;
 
+      // enableBtn.addEventListener('click', async () => {
+      //   try {
+      //     // пытаемся play() — если получилось, считаем что autoplay разрешён
+      //     await remoteAudio.play();
+      //     remoteAudio.muted = false; // можно убрать заглушку
+      //     audioEnabled = true;
+      //     enableBtn.textContent = 'Звук включён';
+      //     enableBtn.disabled = true;
+      //     log('// audio enabled by user gesture');
+      //   } catch (e) {
+      //     // если play() не удалось — оставляем muted, но помечаем что пользователь сделал жест
+      //     audioEnabled = true;
+      //     enableBtn.textContent = 'Жест зафиксирован — звук разрешён после приема потока';
+      //     enableBtn.disabled = true;
+      //     log('// audio enable attempted, play() failed (это нормально в некоторых браузерах):', String(e));
+      //   }
+      // });
+
       enableBtn.addEventListener('click', async () => {
         try {
-          // пытаемся play() — если получилось, считаем что autoplay разрешён
-          await remoteAudio.play();
-          remoteAudio.muted = false; // можно убрать заглушку
+          // resume audio contexts if present or create remoteAudioContext placeholder
+          if (window.localAudioContext && window.localAudioContext.state !== 'running') {
+            await window.localAudioContext.resume();
+          }
+          if (window.remoteAudioContext && window.remoteAudioContext.state !== 'running') {
+            await window.remoteAudioContext.resume();
+          }
+
+          // ensure we have a remoteAudioContext for later WebAudio use
+          if (!window.remoteAudioContext) {
+            window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            // create gain node ready (optional)
+            window._remoteGainNode = window.remoteAudioContext.createGain();
+            window._remoteGainNode.gain.value = 1.0;
+            window._remoteGainNode.connect(window.remoteAudioContext.destination);
+          }
+
+          // unmute HTMLAudio and set volume to max
+          remoteAudio.muted = false;
+          try { remoteAudio.volume = 1.0; } catch (e) { /* ignore on browsers that forbid */ }
+
           audioEnabled = true;
           enableBtn.textContent = 'Звук включён';
           enableBtn.disabled = true;
-          log('// audio enabled by user gesture');
+          log('// audio enabled by user gesture — audio contexts resumed');
+
+          // if stream already arrived — try play (await to catch AbortError)
+          if (remoteAudio.srcObject) {
+            try {
+              if (remoteAudio.paused) {
+                await remoteAudio.play();
+                log('// remote audio play OK (from enableBtn)');
+              }
+            } catch (err) {
+              log('// remoteAudio.play() failed in enableBtn:', String(err));
+            }
+          }
+
         } catch (e) {
-          // если play() не удалось — оставляем muted, но помечаем что пользователь сделал жест
           audioEnabled = true;
           enableBtn.textContent = 'Жест зафиксирован — звук разрешён после приема потока';
           enableBtn.disabled = true;
-          log('// audio enable attempted, play() failed (это нормально в некоторых браузерах):', String(e));
+          log('// audio enable attempted, resume/play failed:', String(e));
         }
       });
+
 
       // WebSocket
       const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
@@ -114,7 +163,7 @@
           const callId = msg.callId || makeCallId();
           pc = new RTCPeerConnection(iceConfig);
           pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
-          pc.ontrack = (e) => {
+          pc.ontrack = async (e) => {
             try {
               log('// ontrack', e.streams);
               const remoteStream = (e.streams && e.streams[0]) || e.stream || null;
@@ -128,58 +177,86 @@
               }
               const rac = window.remoteAudioContext;
 
+              if (!window._remoteGainNode) {
+                window._remoteGainNode = rac.createGain();
+                window._remoteGainNode.gain.value = 1.0;
+                window._remoteGainNode.connect(rac.destination);
+              }
+
+              // подключаем источник в gain (бережно — отключаем старый)
+              if (window._remoteSourceNode) {
+                try { window._remoteSourceNode.disconnect(); } catch (e) { }
+                window._remoteSourceNode = null;
+              }
+              const remoteSource = rac.createMediaStreamSource(remoteStream);
+              remoteSource.connect(window._remoteGainNode);
+              window._remoteSourceNode = remoteSource;
+
               // очистим предыдущий интервал, если был
-              if (window._remoteAnalyserInterval) {
-                clearInterval(window._remoteAnalyserInterval);
-                window._remoteAnalyserInterval = null;
-              }
+              // if (window._remoteAnalyserInterval) {
+              //   clearInterval(window._remoteAnalyserInterval);
+              //   window._remoteAnalyserInterval = null;
+              // }
 
-              try {
-                const remoteSource = rac.createMediaStreamSource(remoteStream);
-                const remoteAnalyser = rac.createAnalyser();
-                remoteAnalyser.fftSize = 2048;
-                remoteSource.connect(remoteAnalyser);
-                const data = new Uint8Array(remoteAnalyser.fftSize);
+              // try {
+              //   const remoteSource = rac.createMediaStreamSource(remoteStream);
+              //   const remoteAnalyser = rac.createAnalyser();
+              //   remoteAnalyser.fftSize = 2048;
+              //   remoteSource.connect(remoteAnalyser);
+              //   const data = new Uint8Array(remoteAnalyser.fftSize);
 
-                // измеряем RMS удалённого аудио
-                window._remoteAnalyserInterval = setInterval(() => {
-                  try {
-                    remoteAnalyser.getByteTimeDomainData(data);
-                    let sum = 0;
-                    for (let i = 0; i < data.length; i++) {
-                      const v = (data[i] - 128) / 128;
-                      sum += v * v;
-                    }
-                    const rms = Math.sqrt(sum / data.length);
-                    const rms100 = Math.round(rms * 1000) / 1000;
-                    log(`// remote-audio-level ${rms100}`);
-                    // отправка на сервер для диагностики
-                    try {
-                      fetch('/debug/log', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                          ts: new Date().toISOString(),
-                          src: 'client-audio-monitor',
-                          kind: 'remote_audio_level',
-                          data: { level: rms100 }
-                        })
-                      }).catch(() => {/* ignore */ });
-                    } catch (e) { }
-                  } catch (err) { /* ignore per-interval errors */ }
-                }, 250);
-              } catch (err) {
-                log('// remote analyser setup failed', String(err));
-              }
+              //   // измеряем RMS удалённого аудио
+              //   window._remoteAnalyserInterval = setInterval(() => {
+              //     try {
+              //       remoteAnalyser.getByteTimeDomainData(data);
+              //       let sum = 0;
+              //       for (let i = 0; i < data.length; i++) {
+              //         const v = (data[i] - 128) / 128;
+              //         sum += v * v;
+              //       }
+              //       const rms = Math.sqrt(sum / data.length);
+              //       const rms100 = Math.round(rms * 1000) / 1000;
+              //       log(`// remote-audio-level ${rms100}`);
+              //       // отправка на сервер для диагностики
+              //       try {
+              //         fetch('/debug/log', {
+              //           method: 'POST',
+              //           headers: { 'Content-Type': 'application/json' },
+              //           body: JSON.stringify({
+              //             ts: new Date().toISOString(),
+              //             src: 'client-audio-monitor',
+              //             kind: 'remote_audio_level',
+              //             data: { level: rms100 }
+              //           })
+              //         }).catch(() => {/* ignore */ });
+              //       } catch (e) { }
+              //     } catch (err) { /* ignore per-interval errors */ }
+              //   }, 250);
+              // } catch (err) {
+              //   log('// remote analyser setup failed', String(err));
+              // }
 
               // попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
+              // if (audioEnabled) {
+              //   aud.muted = false;
+              //   aud.play().then(() => { log('// remote audio play OK'); })
+              //     .catch((err) => { log('// remote audio play failed', String(err)); });
+              // } else {
+              //   // если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn
+              //   aud.muted = true;
+              //   log('// ontrack but waiting for user gesture');
+              // }
+
               if (audioEnabled) {
-                aud.muted = false;
-                aud.play().then(() => { log('// remote audio play OK'); })
-                  .catch((err) => { log('// remote audio play failed', String(err)); });
+                try {
+                  if (remoteAudio.paused) {
+                    await remoteAudio.play();
+                    log('// remote audio play OK (ontrack)');
+                  }
+                } catch (err) {
+                  log('// remote audio play failed (ontrack):', String(err));
+                }
               } else {
-                // если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn
-                aud.muted = true;
                 log('// ontrack but waiting for user gesture');
               }
 
@@ -276,11 +353,7 @@
         // const resp = await fetch('/get-turn-credentials');
         // const data = await resp.json();
 
-        // дефолтный ICE (без TURN) — можно оставить stun или пустой
-        const defaultIce = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-
-
-        pc = new RTCPeerConnection({ defaultIce });
+        pc = new RTCPeerConnection({ iceConfig });
         window.pc = pc;
         pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
         pc.ontrack = (e) => {
