@@ -88,10 +88,16 @@
       const response = await fetch("https://pwa-p.metered.live/api/v1/turn/credentials?apiKey=d294a2a2eadb04e549660dc431b109d1fa00");
       const iceServersAll = await response.json();
 
+      const iceServers = iceServersAll.filter(s => {
+        const u = String(s.urls || "");
+        return u.startsWith("turns:") && u.includes(":443") && u.includes("transport=tcp");
+      });
+
       // Создание PeerConnection
       function createPeerConnection(callId) {
         const connection = new RTCPeerConnection({
-          iceServers: iceServers
+          iceServers: iceServers, 
+          iceTransportPolicy: "relay"
         });
         connection.onicecandidate = e => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
         connection.ontrack = e => {
@@ -99,6 +105,10 @@
           remoteAudio.srcObject = stream;
           if (audioEnabled) remoteAudio.play().catch(() => { });
         };
+
+        connection.oniceconnectionstatechange = () => console.log("ICE state:", connection.iceConnectionState);
+        connection.onconnectionstatechange = () => console.log("connection state:", connection.connectionState);
+
         if (localStream) localStream.getTracks().forEach(t => connection.addTrack(t, localStream));
         return connection;
       }
