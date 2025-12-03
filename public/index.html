@@ -42,223 +42,119 @@
   <audio id="remoteAudio" autoplay playsinline></audio>
 
   <script>
-    (function () {
-      const logEl = document.getElementById('log');
-      const myIdEl = document.getElementById('myId');
+    (async function () {
+      const btnLocal = document.getElementById('btnLocal');
       const btnCall = document.getElementById('btnCall');
-      btnCall.disabled = true; // заблокировать изначально
+      const btnHang = document.getElementById('btnHang');
+      const myIdEl = document.getElementById('myId');
+      const remoteAudio = document.getElementById('remoteAudio');
 
-      window.remoteAudioContext = null;
-      function log(...args) { console.log(...args); logEl.textContent += args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+      btnCall.disabled = true;
+      remoteAudio.autoplay = true;
+      remoteAudio.muted = true;
+      remoteAudio.setAttribute('playsinline', '');
 
       let audioEnabled = false;
-      const enableBtn = document.getElementById('enableAudioBtn') || (function () {
+      let localStream = null;
+      let pc = null;
+      let myId = null;
+
+      // Включение воспроизведения аудио (нужно для iOS/Safari)
+      async function enableAudioPlayback() {
+        if (!window.remoteAudioContext) {
+          window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        await window.remoteAudioContext.resume();
+        remoteAudio.muted = false;
+        if (remoteAudio.srcObject) await remoteAudio.play();
+        audioEnabled = true;
+        btnCall.disabled = false;
+      }
+
+      const enableBtn = document.getElementById('enableAudioBtn') || (() => {
         const b = document.createElement('button');
         b.id = 'enableAudioBtn';
-        b.textContent = 'Включить звук (нужен для авто-воспроизведения)';
+        b.textContent = 'Включить звук';
         b.style.margin = '6px';
         document.body.insertBefore(b, document.getElementById('log'));
         return b;
       })();
 
-      const remoteAudio = document.getElementById('remoteAudio');
-      // если браузер требует пользовательский жест, держим audio muted до нажатия
-      remoteAudio.muted = true;
-      remoteAudio.autoplay = true;
-      remoteAudio.setAttribute('playsinline', '');
+      enableBtn.addEventListener('click', enableAudioPlayback);
 
-      enableBtn.addEventListener('click', async () => {
-
-        // resume / создаём AudioContext, чтобы Safari разрешил воспроизведение
-        try {
-          if (!window.remoteAudioContext) {
-            window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-          }
-          await window.remoteAudioContext.resume();
-          log('// AudioContext resume OK');
-        } catch (e) {
-          log('// AudioContext resume failed', String(e));
-        }
-
-        // Разблокируем кнопку "Позвонить"
-        if (btnCall) btnCall.disabled = false;
-        try {
-          // Разрешаем воспроизведение HTMLAudio
-          remoteAudio.muted = false;
-          try { remoteAudio.volume = 1.0; } catch (e) { /* некоторые браузеры блокируют */ }
-
-          if (remoteAudio.srcObject) {
-            try {
-              await remoteAudio.play(); // важно для iPhone — play() должен быть вызван в обработчике клика
-              log('// remote audio play OK');
-            } catch (err) {
-              log('// remoteAudio.play() failed:', String(err));
-            }
-          }
-
-          audioEnabled = true;
-          enableBtn.textContent = 'Звук включён';
-          enableBtn.disabled = true;
-
-        } catch (e) {
-          log('// audio enable failed:', String(e));
-        }
-      });
-
-      const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
-      const ws = new WebSocket(wsProto + '://' + location.host + '/ws');
-      let myId = null;
-      let pc = null;
-      let localStream = null;
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss' : 'ws') + '://' + location.host + '/ws');
 
       function makeCallId() {
-        try {
-          if (myId) return `${myId}-${Date.now()}`;
-        } catch (e) { }
-        return `c-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        return myId ? `${myId}-${Date.now()}` : `c-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       }
 
-      // добавляем публичный STUN, без TURN — для быстрых тестов
-      const iceConfig = {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' }
-        ]
-      };
+      const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-      ws.addEventListener('open', () => log('// ws OPEN'));
-      ws.addEventListener('message', async (ev) => {
+      // Создание PeerConnection
+      function createPeerConnection(callId) {
+        const connection = new RTCPeerConnection(iceConfig);
+        connection.onicecandidate = e => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
+        connection.ontrack = e => {
+          const stream = (e.streams && e.streams[0]) || e.stream || null;
+          remoteAudio.srcObject = stream;
+          if (audioEnabled) remoteAudio.play().catch(() => { });
+        };
+        if (localStream) localStream.getTracks().forEach(t => connection.addTrack(t, localStream));
+        return connection;
+      }
+
+      ws.addEventListener('message', async ev => {
         let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
-        log('// ws IN', msg.type || msg);
 
-        if (msg.type === 'welcome') { myId = msg.id; myIdEl.textContent = myId; return; }
+        if (msg.type === 'welcome') {
+          myId = msg.id;
+          myIdEl.textContent = myId;
+          return;
+        }
 
         if (msg.type === 'offer') {
-          log('// got offer');
-          if (pc) { pc.close(); pc = null; }
+          if (pc) pc.close();
           const callId = msg.callId || makeCallId();
-          pc = new RTCPeerConnection(iceConfig);
-          pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
-          pc.ontrack = (e) => {
-            try {
-              console.log('// ontrack', e.streams);
-              const remoteStream = (e.streams && e.streams[0]) || e.stream || null;
-              remoteAudio.srcObject = remoteStream;
-
-              // play() вызывать только если пользователь уже сделал жест
-              if (audioEnabled) {
-                remoteAudio.muted = false;
-                remoteAudio.play().then(() => { console.log('// audio play OK (ontrack)'); })
-                  .catch((err) => { console.log('// audio play failed (ontrack)', err); });
-              } else {
-                // иначе оставляем muted и ждём клика enableBtn
-                remoteAudio.muted = true;
-                console.log('// ontrack: waiting for user gesture to play');
-              }
-            } catch (e) {
-              console.log('// ontrack handler failed', e);
-            }
-          };
-
-
-          if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+          pc = createPeerConnection(callId);
           await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-          const ans = await pc.createAnswer();
-          await pc.setLocalDescription(ans);
-          ws.send(JSON.stringify({ type: 'answer', sdp: ans.sdp, callId }));
-
-          log('// answer sent');
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp, callId }));
           return;
         }
 
-        if (msg.type === 'answer') {
-          log('// got answer');
-          if (!pc) return;
-          try { await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }); log('// remoteDescription(answer) set'); } catch (e) { log('// setRemoteDescription(answer) failed', e); }
+        if (msg.type === 'answer' && pc) {
+          await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }).catch(() => { });
           return;
         }
 
-        if (msg.type === 'candidate') {
-          log('// got candidate', msg.callId || '');
-          if (!pc) { log('// no pc yet — ignored candidate'); return; }
-          try { await pc.addIceCandidate(msg.candidate); log('// added candidate'); } catch (e) { log('// addIceCandidate failed', e); }
-          return;
+        if (msg.type === 'candidate' && pc) {
+          await pc.addIceCandidate(msg.candidate).catch(() => { });
         }
       });
 
-      document.getElementById('btnLocal').addEventListener('click', async () => {
-        try {
-          // Запрашиваем доступ к микрофону
-          localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          log('// local stream acquired', localStream.getTracks().map(t => t.kind));
-
-          // здесь можно использовать localStream по назначению (например, добавить в PeerConnection)
-
-        } catch (e) {
-          log('// getUserMedia failed', e);
-        }
+      btnLocal.addEventListener('click', async () => {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
       });
 
-      document.getElementById('btnCall').addEventListener('click', async () => {
-        if (!audioEnabled) {
-          alert('Пожалуйста, нажмите «Включить звук» перед звонком (требование iOS/Safari).');
-          return;
-        }
-        log('// call: start');
-        if (pc) { pc.close(); pc = null; }
+      btnCall.addEventListener('click', async () => {
+        if (!audioEnabled) return alert('Нажмите «Включить звук» перед звонком.');
+        if (pc) pc.close();
         const callId = makeCallId();
-
-        pc = new RTCPeerConnection(iceConfig);
-        window.pc = pc;
-        pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
-        pc.ontrack = (e) => {
-          try {
-            console.log('// ontrack', e.streams);
-            const remoteStream = (e.streams && e.streams[0]) || e.stream || null;
-            remoteAudio.srcObject = remoteStream;
-
-            // play() вызывать только если пользователь уже сделал жест
-            if (audioEnabled) {
-              remoteAudio.muted = false;
-              remoteAudio.play().then(() => { console.log('// audio play OK (ontrack)'); })
-                .catch((err) => { console.log('// audio play failed (ontrack)', err); });
-            } else {
-              // иначе оставляем muted и ждём клика enableBtn
-              remoteAudio.muted = true;
-              console.log('// ontrack: waiting for user gesture to play');
-            }
-          } catch (e) {
-            console.log('// ontrack handler failed', e);
-          }
-        };
-
-        if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
+        pc = createPeerConnection(callId);
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         ws.send(JSON.stringify({ type: 'offer', sdp: offer.sdp }));
-        log('// offer sent');
       });
 
-      document.getElementById('btnHang').addEventListener('click', () => {
-        if (pc) { pc.close(); pc = null; log('// pc closed'); }
-
-        try {
-          if (window._localAnalyserInterval) { clearInterval(window._localAnalyserInterval); window._localAnalyserInterval = null; }
-          if (window.localAudioContext) { try { window.localAudioContext.close(); } catch (e) { } window.localAudioContext = null; }
-        } catch (e) { }
-
-        try {
-          if (window._remoteAnalyserInterval) { clearInterval(window._remoteAnalyserInterval); window._remoteAnalyserInterval = null; }
-          if (window.remoteAudioContext) { try { window.remoteAudioContext.close(); } catch (e) { } window.remoteAudioContext = null; }
-        } catch (e) { }
-
-        try {
-          if (localStream) {
-            localStream.getTracks().forEach(t => { try { t.stop(); } catch (e) { } });
-            localStream = null;
-            log('// local stream stopped');
-          }
-        } catch (e) { }
+      btnHang.addEventListener('click', () => {
+        if (pc) pc.close();
+        pc = null;
+        if (localStream) localStream.getTracks().forEach(t => t.stop());
+        localStream = null;
+        if (window.remoteAudioContext) window.remoteAudioContext.close().catch(() => { });
+        window.remoteAudioContext = null;
+        audioEnabled = false;
       });
     })();
   </script>
