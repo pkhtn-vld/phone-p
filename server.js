@@ -14,6 +14,15 @@ app.use(express.static(path.join(__dirname, 'public')));
 // храним клиентов в Set
 const clients = new Set();
 
+// кастомный upgrade, под WebSocket path /ws
+server.on('upgrade', (req, socket, head) => {
+  if (req.url === '/ws') {
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
+
 wss.on('connection', (ws) => {
   // даём клиенту краткий id
   ws._id = Math.random().toString(36).slice(2, 9);
