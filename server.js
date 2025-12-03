@@ -8,21 +8,8 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
-
 // Отдаём папку public как корень
 app.use(express.static(path.join(__dirname, 'public')));
-
-// простой endpoint health
-app.get('/ping', (req, res) => res.send('ok'));
-
-// кастомный upgrade, под WebSocket path /ws
-server.on('upgrade', (req, socket, head) => {
-  if (req.url === '/ws') {
-    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
-  } else {
-    socket.destroy();
-  }
-});
 
 // храним клиентов в Set
 const clients = new Set();
@@ -41,25 +28,20 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
 
-
     // логирование на сервере
     console.log('// ws: recv', ws._id, msg.type || '(no-type)');
 
-
     // простая пересылка сообщения всем остальным клиентам
-    // в msg можно передать поля from/to — клиент сам их добавляет
     for (const c of clients) {
       if (c === ws) continue;
       try { c.send(JSON.stringify(msg)); } catch (e) { /* ignore */ }
     }
   });
 
-
   ws.on('close', () => {
     clients.delete(ws);
     console.log('// ws: close', ws._id);
   });
-
 
   ws.on('error', (e) => console.warn('// ws: error', ws._id, e && e.message));
 });

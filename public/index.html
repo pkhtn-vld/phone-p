@@ -6,24 +6,9 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>webrtc-minimal</title>
   <style>
-    body {
-      font-family: Arial, Helvetica, sans-serif;
-      padding: 16px
-    }
-
-    button {
-      padding: 8px 12px;
-      margin: 6px
-    }
-
-    #log {
-      white-space: pre-wrap;
-      background: #f6f6f6;
-      padding: 8px;
-      border-radius: 6px;
-      height: 240px;
-      overflow: auto
-    }
+    body { font-family: Arial, Helvetica, sans-serif; padding: 16px }
+    button { padding: 8px 12px; margin: 6px }
+    #log { white-space: pre-wrap; background: #f6f6f6; padding: 8px; border-radius: 6px; height: 240px; overflow: auto }
   </style>
 </head>
 
@@ -31,13 +16,13 @@
   <h3>WebRTC minimal demo</h3>
   <div>
     <button id="btnLocal">Разрешить микрофон</button>
-    <button id="btnCall">Позвонить (всем)</button>
+    <button id="enableAudioBtn">Включить звук (нужен для авто-воспроизведения)</button>
+    <button id="btnCall" disabled>Позвонить (всем)</button>
     <button id="btnHang">Завершить</button>
   </div>
   <div>Ваш id: <span id="myId">-</span></div>
   <div>Логи:</div>
   <div id="log"></div>
-
 
   <audio id="remoteAudio" autoplay playsinline></audio>
 
@@ -45,41 +30,53 @@
     (function () {
       const logEl = document.getElementById('log');
       const myIdEl = document.getElementById('myId');
+      const btnCall = document.getElementById('btnCall');
       function log(...args) { console.log(...args); logEl.textContent += args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') + '\n'; logEl.scrollTop = logEl.scrollHeight; }
 
       let audioEnabled = false;
-      let enableBtn = document.getElementById('enableAudioBtn');
-
-      if (!enableBtn) {
-        enableBtn = document.createElement('button');
-        enableBtn.id = 'enableAudioBtn';
-        enableBtn.textContent = 'Включить звук (нужен для авто-воспроизведения)';
-        enableBtn.style.margin = '6px';
-        document.body.insertBefore(enableBtn, document.getElementById('log'));
-      }
+      const enableBtn = document.getElementById('enableAudioBtn');
 
       const remoteAudio = document.getElementById('remoteAudio');
-      // если браузер требует пользовательский жест, держим audio muted до нажатия
+      // Начально muted — чтобы браузер не пытался автопроигрывать без жеста.
       remoteAudio.muted = true;
+      remoteAudio.autoplay = true;
+      remoteAudio.setAttribute('playsinline', ''); // на будущее, если будете видео
+
+      // AudioContext может понадобиться для визуализации/анализаторов.
+      // Создаём лениво только при необходимости.
+      window.remoteAudioContext = null;
 
       enableBtn.addEventListener('click', async () => {
         try {
-          // Разрешаем воспроизведение HTMLAudio
-          remoteAudio.muted = false;
-          try { remoteAudio.volume = 1.0; } catch (e) { /* некоторые браузеры блокируют */ }
-
-          if (remoteAudio.srcObject) {
-            try {
-              await remoteAudio.play(); // важно для iPhone — play() должен быть вызван в обработчике клика
-              log('// remote audio play OK');
-            } catch (err) {
-              log('// remoteAudio.play() failed:', String(err));
-            }
-          }
-
+          // Установим флаг и разблокируем аудио.
           audioEnabled = true;
           enableBtn.textContent = 'Звук включён';
           enableBtn.disabled = true;
+
+          // Включаем кнопку "Позвонить" только после жеста пользователя.
+          btnCall.disabled = false;
+
+          // Resume AudioContext, если он был создан ранее (или создадим новый "разбудив" звук)
+          try {
+            if (!window.remoteAudioContext) {
+              window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            await window.remoteAudioContext.resume();
+            log('// AudioContext resume OK');
+          } catch (e) {
+            log('// AudioContext resume failed', String(e));
+          }
+
+          // Если remote stream уже пришёл — назначим и запустим play() внутри обработчика клика (это важно для iOS)
+          if (remoteAudio.srcObject) {
+            try {
+              remoteAudio.muted = false;
+              await remoteAudio.play();
+              log('// remote audio play OK (from enable click)');
+            } catch (err) {
+              log('// remoteAudio.play() failed (from enable click):', String(err));
+            }
+          }
 
         } catch (e) {
           log('// audio enable failed:', String(e));
@@ -93,13 +90,10 @@
       let localStream = null;
 
       function makeCallId() {
-        try {
-          if (myId) return `${myId}-${Date.now()}`;
-        } catch (e) { }
+        try { if (myId) return `${myId}-${Date.now()}`; } catch (e) { }
         return `c-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       }
 
-      // добавляем публичный STUN, без TURN — для быстрых тестов
       const iceConfig = {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' }
@@ -118,7 +112,9 @@
           if (pc) { pc.close(); pc = null; }
           const callId = msg.callId || makeCallId();
           pc = new RTCPeerConnection(iceConfig);
+
           pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
+
           pc.ontrack = (e) => {
             try {
               log('// ontrack', e.streams);
@@ -126,22 +122,17 @@
               const aud = remoteAudio;
               aud.srcObject = remoteStream;
 
-              if (!window.remoteAudioContext) {
-                window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-              }
-              const rac = window.remoteAudioContext;
-
-              // попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
+              // Если пользователь уже сделал жест — можно сразу play()
               if (audioEnabled) {
                 aud.muted = false;
-                aud.play().then(() => { log('// audio play OK'); })
-                  .catch((err) => { log('// audio play failed', String(err)); });
+                // play() вызывается только когда был user gesture (enableBtn)
+                aud.play().then(() => { log('// audio play OK (ontrack)'); })
+                  .catch((err) => { log('// audio play failed (ontrack)', String(err)); });
               } else {
-                // если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn
+                // Оставляем muted и ждём нажатия enableAudioBtn
                 aud.muted = true;
-                log('// если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn');
+                log('// ontrack: waiting for user gesture to play');
               }
-
             } catch (e) {
               log('// ontrack handler failed', e);
             }
@@ -174,23 +165,25 @@
 
       document.getElementById('btnLocal').addEventListener('click', async () => {
         try {
-          // Запрашиваем доступ к микрофону
           localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
           log('// local stream acquired', localStream.getTracks().map(t => t.kind));
-
-          // здесь можно использовать localStream по назначению (например, добавить в PeerConnection)
-
         } catch (e) {
           log('// getUserMedia failed', e);
         }
       });
 
-      document.getElementById('btnCall').addEventListener('click', async () => {
+      // Позвонить — запрещаем, если пользователь ещё не сделал жест для воспроизведения
+      btnCall.addEventListener('click', async () => {
         log('// call: start');
+        if (!audioEnabled) {
+          alert('Пожалуйста, нажмите «Включить звук» перед звонком (требование iOS/Safari).');
+          return;
+        }
+
         if (pc) { pc.close(); pc = null; }
         const callId = makeCallId();
 
-        pc = new RTCPeerConnection({ iceConfig });
+        pc = new RTCPeerConnection(iceConfig);
         window.pc = pc;
         pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate, callId })); };
         pc.ontrack = (e) => {
@@ -200,20 +193,13 @@
             const aud = remoteAudio;
             aud.srcObject = remoteStream;
 
-            if (!window.remoteAudioContext) {
-              window.remoteAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-            const rac = window.remoteAudioContext;
-
-            // попытка play() — если пользователь уже сделал жест, play выполнится; иначе будет ошибка и мы ждём жеста
             if (audioEnabled) {
               aud.muted = false;
               aud.play().then(() => { log('// audio play OK'); })
                 .catch((err) => { log('// audio play failed', String(err)); });
             } else {
-              // если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn
               aud.muted = true;
-              log('// если пользовательский жест не сделан — оставляем muted и ждем нажатия enableAudioBtn');
+              log('// ontrack: waiting for user gesture to play');
             }
 
           } catch (e) {
